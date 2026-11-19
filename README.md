@@ -167,7 +167,7 @@ Zakładki tworzone automatycznie (nie trzeba ich tworzyć ręcznie):
 | Zakładka | Zawartość |
 |---|---|
 | `alarm_shifts` | Agregaty zmianowe: `date, shift, sorter_id, code, name, cnt, duration` |
-| `alarm_events` | Pojedyncze zdarzenia: `event_ts, sorter_id, code, full_name, duration` |
+| `alarm_events` | Pojedyncze zdarzenia: `event_ts, sorter_id, code, full_name, duration, event_start_ts` |
 | `alarm_meta` | Metadane SFTP: `sorter_id, host, filename, remote_path, size_bytes, status` |
 
 ### Pomijanie uploadu gdy brak zmian
@@ -192,11 +192,13 @@ POSTGRES_TABLE_EVENTS = os.getenv("SORTER_PG_TABLE_EVENTS", "alarm_events")
 
 Do PostgreSQL trafiają tylko pojedyncze eventy (`alarm_shifts` nie są zapisywane).
 
+Kolumna `event_start_ts` jest dodawana automatycznie także do istniejącej tabeli.
+
 ### Tryby historii
 
 | Ustawienie | Zachowanie |
 |---|---|
-| `POSTGRES_REPLACE_TODAY = False` | Dopisuje eventy, duplikaty blokowane przez `UNIQUE + ON CONFLICT DO NOTHING` |
+| `POSTGRES_REPLACE_TODAY = False` | Dopisuje eventy; dla duplikatów aktualizuje `event_start_ts` |
 | `POSTGRES_REPLACE_TODAY = True` | Usuwa i wstawia rekordy z bieżącego dnia od nowa |
 
 Jeśli istniała stara tabela `alarm_events` z inną strukturą (np. z kolumną `shift`):
@@ -220,6 +222,13 @@ Format wejściowy w logach: `MM:SS:CC` (minuty : sekundy : centysekundy).
 ```
 
 Wynik końcowy formatowany do `HH:MM:SS`.
+
+### Czas rozpoczęcia i zakończenia
+
+W rekordzie o statusie `OK` pole czasu oznacza zakończenie zdarzenia i trafia do
+`event_ts`. Czas rozpoczęcia jest obliczany z pełną precyzją jako
+`event_start_ts = event_ts - duration`. Data raportowa i przypisanie do zmiany
+wynikają z `event_start_ts`.
 
 ### Grupowanie w `alarm_shifts`
 
