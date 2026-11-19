@@ -33,6 +33,7 @@ def ensure_events_table(conn):
 
     CREATE TABLE IF NOT EXISTS {full_table} (
         event_ts timestamp not null,
+        event_start_ts timestamp,
         sorter_id text not null,
         code integer,
         full_name text,
@@ -42,8 +43,19 @@ def ensure_events_table(conn):
             UNIQUE (event_ts, sorter_id, code, full_name, duration)
     );
 
+    ALTER TABLE {full_table}
+        ADD COLUMN IF NOT EXISTS event_start_ts timestamp;
+
+    UPDATE {full_table}
+    SET event_start_ts = event_ts - duration::interval
+    WHERE event_start_ts IS NULL
+      AND duration ~ '^[0-9]+:[0-9]{{2}}:[0-9]{{2}}$';
+
     CREATE INDEX IF NOT EXISTS idx_{POSTGRES_TABLE_EVENTS}_event_ts
         ON {full_table}(event_ts);
+
+    CREATE INDEX IF NOT EXISTS idx_{POSTGRES_TABLE_EVENTS}_event_start_ts
+        ON {full_table}(event_start_ts);
 
     CREATE INDEX IF NOT EXISTS idx_{POSTGRES_TABLE_EVENTS}_sorter_code
         ON {full_table}(sorter_id, code);
@@ -71,12 +83,16 @@ def replace_today_events(conn, events_df):
         if pd.isna(event_ts):
             continue
 
+        event_start_ts = row["event_start_ts"]
+        event_start_out = None if pd.isna(event_start_ts) else event_start_ts.to_pydatetime()
+
         code_val = row["code"]
         code_out = None if pd.isna(code_val) else int(code_val)
 
         rows.append(
             (
                 event_ts.to_pydatetime(),
+                event_start_out,
                 str(row["sorter_id"]),
                 code_out,
                 str(row["full_name"]),
@@ -97,11 +113,12 @@ def replace_today_events(conn, events_df):
 
         cur.executemany(
             f"""
-            INSERT INTO {full_table}
-                (event_ts, sorter_id, code, full_name, duration)
-            VALUES (%s, %s, %s, %s, %s)
+            INSERT INTO {full_table} AS existing
+                (event_ts, event_start_ts, sorter_id, code, full_name, duration)
+            VALUES (%s, %s, %s, %s, %s, %s)
             ON CONFLICT (event_ts, sorter_id, code, full_name, duration)
-            DO NOTHING
+            DO UPDATE SET event_start_ts = EXCLUDED.event_start_ts
+            WHERE existing.event_start_ts IS DISTINCT FROM EXCLUDED.event_start_ts
             """,
             rows
         )

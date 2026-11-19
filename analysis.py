@@ -13,7 +13,14 @@ from config import (
 )
 
 SHIFT_RESULT_COLUMNS = ["date", "shift", "sorter_id", "code", "name", "cnt", "duration"]
-EVENT_RESULT_COLUMNS = ["event_ts", "sorter_id", "code", "full_name", "duration"]
+EVENT_RESULT_COLUMNS = [
+    "event_ts",
+    "sorter_id",
+    "code",
+    "full_name",
+    "duration",
+    "event_start_ts",
+]
 
 
 def _parse_duration_to_seconds(value):
@@ -151,17 +158,28 @@ def prepare_dataframe_for_analysis(df: pd.DataFrame, nr_list: list[int]) -> pd.D
         "duration_raw",
         "dur_sec",
         "event_ts",
+        "event_start_ts",
     ]
 
     if df.empty:
         return pd.DataFrame(columns=columns)
 
     work = df.copy()
-    work["start"] = work["start"].astype(str).str.slice(0, 8)
+    work["duration_raw"] = work["duration"].astype(str)
+    work["dur_sec"] = work["duration"].map(_parse_duration_to_seconds)
+
+    # A timestamp on an OK row is the event end. Keep the input precision for
+    # calculations and format timestamps to seconds only for exported results.
+    event_end_dt = pd.to_datetime(
+        work["date"].astype(str) + " " + work["start"].astype(str),
+        errors="coerce",
+    )
+    event_start_dt = event_end_dt - pd.to_timedelta(work["dur_sec"], unit="s")
+    event_start_clock = event_start_dt.dt.strftime("%H:%M:%S")
 
     work["shift"] = pd.NA
-    shift1_mask = work["start"].between(SHIFT_1_START, SHIFT_1_END)
-    shift2_mask = work["start"].between(SHIFT_2_START, SHIFT_2_END)
+    shift1_mask = event_start_clock.between(SHIFT_1_START, SHIFT_1_END)
+    shift2_mask = event_start_clock.between(SHIFT_2_START, SHIFT_2_END)
 
     work.loc[shift1_mask, "shift"] = 1
     work.loc[shift2_mask, "shift"] = 2
@@ -177,11 +195,12 @@ def prepare_dataframe_for_analysis(df: pd.DataFrame, nr_list: list[int]) -> pd.D
 
     work["name"] = work["alarm"].map(lambda x: build_alarm_name(x, ALARM_NAME_MODE))
     work["full_name"] = work["alarm"].astype(str)
-    work["duration_raw"] = work["duration"].astype(str)
-    work["dur_sec"] = work["duration"].map(_parse_duration_to_seconds)
-
-    # timestamp pod bazę / BI
-    work["event_ts"] = work["date"].astype(str) + " " + work["start"].astype(str)
+    # The reporting date and shift belong to the event start. event_ts remains
+    # the end timestamp for compatibility with existing reports.
+    work["date"] = event_start_dt.dt.strftime("%Y-%m-%d")
+    work["start"] = event_start_clock
+    work["event_ts"] = event_end_dt.dt.strftime("%Y-%m-%d %H:%M:%S")
+    work["event_start_ts"] = event_start_dt.dt.strftime("%Y-%m-%d %H:%M:%S")
 
     work["nr"] = work["nr"].astype(int)
     work["shift"] = work["shift"].astype(int)
@@ -214,7 +233,8 @@ def run_query_shifts(df: pd.DataFrame, nr_list: list[int]) -> pd.DataFrame:
 def build_event_records(df: pd.DataFrame, nr_list: list[int]) -> pd.DataFrame:
     """
     Pojedyncze rekordy zdarzeń:
-    - timestamp zamiast osobno date/start
+    - event_ts jako czas zakończenia
+    - event_start_ts jako czas rozpoczęcia
     - bez kolumny name
     - bez kolumny shift
     - duration w formacie HH:MM:SS
@@ -253,7 +273,7 @@ def dataframe_for_sheet(df: pd.DataFrame) -> pd.DataFrame:
 def dataframe_for_postgres_events(df: pd.DataFrame) -> pd.DataFrame:
     """
     Przygotowanie eventów do bazy:
-    - event_ts jako datetime
+    - oba timestampy jako datetime
     - code jako liczba
     """
     if df.empty:
@@ -261,6 +281,7 @@ def dataframe_for_postgres_events(df: pd.DataFrame) -> pd.DataFrame:
 
     out = df.copy()
     out["event_ts"] = pd.to_datetime(out["event_ts"], errors="coerce")
+    out["event_start_ts"] = pd.to_datetime(out["event_start_ts"], errors="coerce")
     out["sorter_id"] = out["sorter_id"].astype(str)
     out["code"] = pd.to_numeric(out["code"], errors="coerce").astype("Int64")
     out["full_name"] = out["full_name"].astype(str)
