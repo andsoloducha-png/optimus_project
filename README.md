@@ -32,6 +32,10 @@ sorter_monitor/
 ├─ google_sheets.py
 ├─ state_cache.py
 ├─ postgres_export.py
+├─ skrypty_google_sheets/
+│  ├─ Kod.gs.txt
+│  └─ Czyszczenie.gs.txt
+├─ tests/
 ├─ main.py
 └─ README.md
 ```
@@ -169,6 +173,19 @@ Zakładki tworzone automatycznie (nie trzeba ich tworzyć ręcznie):
 | `alarm_shifts` | Agregaty zmianowe: `date, shift, sorter_id, code, name, cnt, duration` |
 | `alarm_events` | Pojedyncze zdarzenia: `event_ts, sorter_id, code, full_name, duration, event_start_ts` |
 | `alarm_meta` | Metadane SFTP: `sorter_id, host, filename, remote_path, size_bytes, status` |
+
+### Skrypty Apps Script
+
+Folder `skrypty_google_sheets` zawiera skrypty uruchamiane po stronie arkusza:
+
+- `Kod.gs.txt` archiwizuje dane do `alarm_shift_db` i `alarm_events_db`, synchronizuje nagłówki, dodaje brakującą kolumnę `event_start_ts` i uzupełnia ją w historycznych wierszach.
+- `Czyszczenie.gs.txt` usuwa dane starsze niż skonfigurowany okres. Dla zdarzeń używa `event_start_ts`, a w starszych wierszach bez tej wartości korzysta z `event_ts`.
+
+Składnię i funkcje pomocnicze można sprawdzić lokalnie:
+
+```powershell
+node tests/test_google_sheets_scripts.js
+```
 
 ### Pomijanie uploadu gdy brak zmian
 

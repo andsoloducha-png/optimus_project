@@ -1,0 +1,325 @@
+function archiveProductionData() {
+  const lock = LockService.getScriptLock();
+
+  if (!lock.tryLock(30000)) {
+    console.log("Inne wykonanie archiwizacji nadal trwa. Pomijam uruchomienie.");
+    return;
+  }
+
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const tasks = [
+      {
+        source: "alarm_shifts",
+        target: "alarm_shift_db",
+        keyHeaders: ["date", "shift", "sorter_id", "code"]
+      },
+      {
+        source: "alarm_events",
+        target: "alarm_events_db",
+        keyHeaders: ["event_ts", "sorter_id", "code", "full_name", "duration"],
+        backfillEventStart: true
+      }
+    ];
+
+    tasks.forEach(task => archiveSheet_(ss, task));
+  } catch (err) {
+    console.error("Błąd archiveProductionData: " + err.message);
+    console.error(err.stack);
+    throw err;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function archiveSheet_(ss, task) {
+  const sourceSheet = ss.getSheetByName(task.source);
+  const targetSheet = ss.getSheetByName(task.target);
+
+  if (!sourceSheet || !targetSheet) {
+    console.log("Brak arkusza źródłowego lub docelowego dla: " + task.source);
+    return;
+  }
+
+  const sourceLastRow = sourceSheet.getLastRow();
+  const sourceLastColumn = sourceSheet.getLastColumn();
+
+  if (sourceLastRow < 1 || sourceLastColumn < 1) {
+    console.log("Brak danych dla " + task.source);
+    return;
+  }
+
+  const sourceDisplayData = sourceSheet
+    .getRange(1, 1, sourceLastRow, sourceLastColumn)
+    .getDisplayValues();
+  const sourceHeaders = sourceDisplayData[0].map(normalizeHeader_);
+  validateHeaders_(sourceHeaders, task.source);
+
+  const targetHeaders = ensureTargetHeaders_(targetSheet, sourceHeaders);
+  validateHeaders_(targetHeaders, task.target);
+
+  if (task.backfillEventStart) {
+    backfillEventStartTimestamps_(ss, targetSheet, targetHeaders);
+  }
+
+  if (sourceLastRow < 2) {
+    console.log("Brak wierszy danych dla " + task.source);
+    return;
+  }
+
+  const sourceDisplayRows = sourceDisplayData.slice(1);
+  const sourceRawRows = sourceSheet
+    .getRange(2, 1, sourceLastRow - 1, sourceLastColumn)
+    .getValues();
+  const sourceKeyIndexes = headerIndexes_(
+    sourceHeaders,
+    task.keyHeaders,
+    task.source
+  );
+  const targetKeyIndexes = headerIndexes_(
+    targetHeaders,
+    task.keyHeaders,
+    task.target
+  );
+  const sourceIndexByHeader = new Map(
+    sourceHeaders.map((header, index) => [header, index])
+  );
+
+  const existingKeys = new Set();
+  const targetLastRow = targetSheet.getLastRow();
+
+  if (targetLastRow >= 2) {
+    const targetDisplayRows = targetSheet
+      .getRange(2, 1, targetLastRow - 1, targetHeaders.length)
+      .getDisplayValues();
+
+    targetDisplayRows.forEach(row => {
+      if (!isBlankRow_(row)) {
+        existingKeys.add(buildRowKey_(row, targetKeyIndexes));
+      }
+    });
+  }
+
+  const rowsToAppend = [];
+
+  sourceDisplayRows.forEach((displayRow, rowIndex) => {
+    if (isBlankRow_(displayRow)) return;
+
+    const key = buildRowKey_(displayRow, sourceKeyIndexes);
+    if (existingKeys.has(key)) return;
+
+    existingKeys.add(key);
+    const rawRow = sourceRawRows[rowIndex];
+    const alignedRow = targetHeaders.map(header => {
+      const sourceIndex = sourceIndexByHeader.get(header);
+      return sourceIndex === undefined ? "" : rawRow[sourceIndex];
+    });
+    rowsToAppend.push(alignedRow);
+  });
+
+  if (rowsToAppend.length === 0) {
+    console.log("Brak nowych danych dla " + task.source);
+    return;
+  }
+
+  targetSheet
+    .getRange(targetLastRow + 1, 1, rowsToAppend.length, targetHeaders.length)
+    .setValues(rowsToAppend);
+  console.log("Dodano " + rowsToAppend.length + " wierszy do " + task.target);
+}
+
+function ensureTargetHeaders_(sheet, sourceHeaders) {
+  const lastRow = sheet.getLastRow();
+  const lastColumn = sheet.getLastColumn();
+
+  if (lastRow < 1 || lastColumn < 1) {
+    sheet.getRange(1, 1, 1, sourceHeaders.length).setValues([sourceHeaders]);
+    return sourceHeaders.slice();
+  }
+
+  const targetHeaders = sheet
+    .getRange(1, 1, 1, lastColumn)
+    .getDisplayValues()[0]
+    .map(normalizeHeader_);
+  const targetHeaderSet = new Set(targetHeaders);
+  const missingHeaders = sourceHeaders.filter(header => !targetHeaderSet.has(header));
+
+  if (missingHeaders.length > 0) {
+    sheet
+      .getRange(1, targetHeaders.length + 1, 1, missingHeaders.length)
+      .setValues([missingHeaders]);
+    targetHeaders.push(...missingHeaders);
+    console.log(
+      "Dodano kolumny do " + sheet.getName() + ": " + missingHeaders.join(", ")
+    );
+  }
+
+  return targetHeaders;
+}
+
+function backfillEventStartTimestamps_(ss, sheet, headers) {
+  const eventEndIndex = headers.indexOf("event_ts");
+  const durationIndex = headers.indexOf("duration");
+  const eventStartIndex = headers.indexOf("event_start_ts");
+  const lastRow = sheet.getLastRow();
+
+  if (
+    lastRow < 2 ||
+    eventEndIndex < 0 ||
+    durationIndex < 0 ||
+    eventStartIndex < 0
+  ) {
+    return;
+  }
+
+  const rowCount = lastRow - 1;
+  const rawRows = sheet.getRange(2, 1, rowCount, headers.length).getValues();
+  const displayRows = sheet
+    .getRange(2, 1, rowCount, headers.length)
+    .getDisplayValues();
+  const startValues = sheet
+    .getRange(2, eventStartIndex + 1, rowCount, 1)
+    .getValues();
+  const timeZone = ss.getSpreadsheetTimeZone();
+  let changed = 0;
+
+  for (let i = 0; i < rowCount; i++) {
+    if (String(displayRows[i][eventStartIndex] || "").trim()) continue;
+
+    const eventEnd = parseArchiveDate_(
+      rawRows[i][eventEndIndex],
+      displayRows[i][eventEndIndex],
+      timeZone
+    );
+    const durationSeconds = parseArchiveDurationSeconds_(
+      displayRows[i][durationIndex]
+    );
+
+    if (!eventEnd || durationSeconds === null) continue;
+
+    const eventStart = new Date(eventEnd.getTime() - durationSeconds * 1000);
+    startValues[i][0] = Utilities.formatDate(
+      eventStart,
+      timeZone,
+      "yyyy-MM-dd HH:mm:ss"
+    );
+    changed++;
+  }
+
+  if (changed > 0) {
+    sheet
+      .getRange(2, eventStartIndex + 1, rowCount, 1)
+      .setValues(startValues);
+    console.log(
+      "Uzupełniono event_start_ts w " + changed + " historycznych wierszach."
+    );
+  }
+}
+
+function parseArchiveDate_(rawValue, displayValue, timeZone) {
+  if (rawValue instanceof Date && !isNaN(rawValue.getTime())) {
+    return new Date(rawValue.getTime());
+  }
+
+  let text = String(displayValue || rawValue || "").trim();
+  if (!text) return null;
+
+  let match = text.match(
+    /^(\d{4})-(\d{1,2})-(\d{1,2})(?:\s+(\d{1,2}):(\d{2})(?::(\d{2}))?)?$/
+  );
+
+  if (match) {
+    text =
+      match[1] +
+      "-" +
+      String(match[2]).padStart(2, "0") +
+      "-" +
+      String(match[3]).padStart(2, "0") +
+      " " +
+      String(match[4] || 0).padStart(2, "0") +
+      ":" +
+      String(match[5] || 0).padStart(2, "0") +
+      ":" +
+      String(match[6] || 0).padStart(2, "0");
+  } else {
+    match = text.match(
+      /^(\d{1,2})\.(\d{1,2})\.(\d{4})(?:\s+(\d{1,2}):(\d{2})(?::(\d{2}))?)?$/
+    );
+    if (!match) return null;
+
+    text =
+      match[3] +
+      "-" +
+      String(match[2]).padStart(2, "0") +
+      "-" +
+      String(match[1]).padStart(2, "0") +
+      " " +
+      String(match[4] || 0).padStart(2, "0") +
+      ":" +
+      String(match[5] || 0).padStart(2, "0") +
+      ":" +
+      String(match[6] || 0).padStart(2, "0");
+  }
+
+  try {
+    return Utilities.parseDate(text, timeZone, "yyyy-MM-dd HH:mm:ss");
+  } catch (err) {
+    return null;
+  }
+}
+
+function parseArchiveDurationSeconds_(value) {
+  const match = String(value || "")
+    .trim()
+    .match(/^(\d+):(\d{2}):(\d{2})$/);
+
+  if (!match) return null;
+
+  const hours = Number(match[1]);
+  const minutes = Number(match[2]);
+  const seconds = Number(match[3]);
+
+  if (minutes > 59 || seconds > 59) return null;
+
+  return hours * 3600 + minutes * 60 + seconds;
+}
+
+function headerIndexes_(headers, requiredHeaders, sheetName) {
+  return requiredHeaders.map(header => {
+    const index = headers.indexOf(header);
+    if (index < 0) {
+      throw new Error(
+        "Brak wymaganej kolumny " + header + " w arkuszu " + sheetName
+      );
+    }
+    return index;
+  });
+}
+
+function validateHeaders_(headers, sheetName) {
+  const seen = new Set();
+
+  headers.forEach(header => {
+    if (!header) {
+      throw new Error("Pusty nagłówek w arkuszu " + sheetName);
+    }
+    if (seen.has(header)) {
+      throw new Error("Powtórzony nagłówek " + header + " w arkuszu " + sheetName);
+    }
+    seen.add(header);
+  });
+}
+
+function normalizeHeader_(value) {
+  return String(value || "").trim();
+}
+
+function buildRowKey_(row, indexes) {
+  return JSON.stringify(
+    indexes.map(index => String(row[index] || "").trim())
+  );
+}
+
+function isBlankRow_(row) {
+  return row.every(value => String(value || "").trim() === "");
+}

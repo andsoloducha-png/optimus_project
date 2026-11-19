@@ -1,0 +1,207 @@
+function cleanupOldDbData() {
+  const lock = LockService.getScriptLock();
+
+  if (!lock.tryLock(30000)) {
+    console.log("Inne wykonanie skryptu nadal trwa. Pomijam cleanup.");
+    return;
+  }
+
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+    const configs = [
+      {
+        sheetName: "alarm_shift_db",
+        dateHeaders: ["date"],
+        keepDays: 90
+      },
+      {
+        sheetName: "alarm_events_db",
+        // Nowe rekordy czyścimy po czasie rozpoczęcia. event_ts jest
+        // fallbackiem dla historycznych wierszy sprzed dodania nowej kolumny.
+        dateHeaders: ["event_start_ts", "event_ts"],
+        keepDays: 90
+      }
+    ];
+
+    configs.forEach(config => {
+      const sheet = ss.getSheetByName(config.sheetName);
+
+      if (!sheet) {
+        console.log("Brak arkusza: " + config.sheetName);
+        return;
+      }
+
+      const deleted = deleteRowsOlderThan_(
+        sheet,
+        config.dateHeaders,
+        config.keepDays
+      );
+
+      console.log(
+        "Cleanup " +
+          config.sheetName +
+          ": usunięto " +
+          deleted +
+          " wierszy starszych niż " +
+          config.keepDays +
+          " dni."
+      );
+    });
+  } catch (err) {
+    console.error("Błąd cleanupOldDbData: " + err.message);
+    console.error(err.stack);
+    throw err;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function deleteRowsOlderThan_(sheet, dateHeaders, keepDays) {
+  const lastRow = sheet.getLastRow();
+  const lastColumn = sheet.getLastColumn();
+
+  if (lastRow < 2 || lastColumn < 1) return 0;
+
+  const rowCount = lastRow - 1;
+  const headers = sheet
+    .getRange(1, 1, 1, lastColumn)
+    .getDisplayValues()[0]
+    .map(value => String(value || "").trim());
+  const dateIndexes = resolveDateHeaderIndexes_(headers, dateHeaders);
+
+  if (dateIndexes.length === 0) {
+    throw new Error(
+      "Brak kolumny daty w arkuszu " +
+        sheet.getName() +
+        ". Oczekiwano: " +
+        dateHeaders.join(", ")
+    );
+  }
+
+  const displayValues = sheet
+    .getRange(2, 1, rowCount, lastColumn)
+    .getDisplayValues();
+
+  const cutoff = new Date();
+  cutoff.setDate(cutoff.getDate() - keepDays);
+  cutoff.setHours(0, 0, 0, 0);
+
+  console.log("Cleanup " + sheet.getName() + " cutoff=" + cutoff);
+
+  const rowsToDelete = [];
+
+  for (let i = 0; i < rowCount; i++) {
+    const textValue = firstNonEmptyValue_(displayValues[i], dateIndexes);
+    const rowDate = parseDateFromSheetValue_(textValue);
+
+    if (!rowDate) {
+      console.log(
+        "Pominięto wiersz " +
+          (i + 2) +
+          " - nie rozpoznano daty: " +
+          textValue
+      );
+      continue;
+    }
+
+    rowDate.setHours(0, 0, 0, 0);
+
+    if (rowDate < cutoff) {
+      rowsToDelete.push(i + 2);
+    }
+  }
+
+  console.log(
+    sheet.getName() +
+      ": znaleziono do usunięcia " +
+      rowsToDelete.length +
+      " wierszy"
+  );
+
+  deleteRowsInGroups_(sheet, rowsToDelete);
+
+  return rowsToDelete.length;
+}
+
+function resolveDateHeaderIndexes_(headers, preferredHeaders) {
+  return preferredHeaders
+    .map(header => headers.indexOf(header))
+    .filter(index => index >= 0);
+}
+
+function firstNonEmptyValue_(row, indexes) {
+  for (let i = 0; i < indexes.length; i++) {
+    const value = String(row[indexes[i]] || "").trim();
+    if (value) return value;
+  }
+
+  return "";
+}
+
+function parseDateFromSheetValue_(value) {
+  const text = String(value || "").trim();
+
+  if (!text) return null;
+
+  // Format:
+  // 2026-03-24
+  // 2026-03-23 08:22:36
+  let match = text.match(
+    /^(\d{4})-(\d{1,2})-(\d{1,2})(?:\s+(\d{1,2}):(\d{2})(?::(\d{2}))?)?$/
+  );
+
+  if (match) {
+    const year = Number(match[1]);
+    const month = Number(match[2]) - 1;
+    const day = Number(match[3]);
+    const hour = match[4] ? Number(match[4]) : 0;
+    const minute = match[5] ? Number(match[5]) : 0;
+    const second = match[6] ? Number(match[6]) : 0;
+
+    return new Date(year, month, day, hour, minute, second);
+  }
+
+  // Format awaryjny:
+  // 23.03.2026
+  // 23.03.2026 08:22:36
+  match = text.match(
+    /^(\d{1,2})\.(\d{1,2})\.(\d{4})(?:\s+(\d{1,2}):(\d{2})(?::(\d{2}))?)?$/
+  );
+
+  if (match) {
+    const day = Number(match[1]);
+    const month = Number(match[2]) - 1;
+    const year = Number(match[3]);
+    const hour = match[4] ? Number(match[4]) : 0;
+    const minute = match[5] ? Number(match[5]) : 0;
+    const second = match[6] ? Number(match[6]) : 0;
+
+    return new Date(year, month, day, hour, minute, second);
+  }
+
+  return null;
+}
+
+function deleteRowsInGroups_(sheet, rowsToDelete) {
+  if (rowsToDelete.length === 0) return;
+
+  rowsToDelete.sort((a, b) => b - a);
+
+  let groupStart = rowsToDelete[0];
+  let groupCount = 1;
+
+  for (let i = 1; i < rowsToDelete.length; i++) {
+    const row = rowsToDelete[i];
+
+    if (row === groupStart - groupCount) {
+      groupCount++;
+    } else {
+      sheet.deleteRows(groupStart - groupCount + 1, groupCount);
+      groupStart = row;
+      groupCount = 1;
+    }
+  }
+
+  sheet.deleteRows(groupStart - groupCount + 1, groupCount);
+}
